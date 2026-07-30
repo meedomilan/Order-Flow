@@ -1,12 +1,10 @@
-
-
-
 import asyncio
 import json
 import logging
 import os
 import signal
 import time
+import random
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from pathlib import Path
@@ -22,8 +20,11 @@ from aiohttp import web
 # الفريمات فقط: 15m, 1h, 4h
 # ============================================================
 
-BINANCE_REST = "https://fapi.binance.com"
-BINANCE_WS = "wss://fstream.binance.com/ws"
+BINANCE_REST_BASES = [x.strip().rstrip("/") for x in os.getenv(
+    "BINANCE_REST_BASES",
+    "https://fapi.binance.com,https://fapi1.binance.com,https://fapi2.binance.com,https://fapi3.binance.com,https://fapi4.binance.com",
+).split(",") if x.strip()]
+BINANCE_WS = os.getenv("BINANCE_WS", "wss://fstream.binance.com/ws")
 TELEGRAM_API = "https://api.telegram.org"
 RIYADH = ZoneInfo("Asia/Riyadh")
 
@@ -41,8 +42,9 @@ ZONE_SOURCE = os.getenv("ZONE_SOURCE", "Body + Wick")
 BREAK_BY_CLOSE = os.getenv("BREAK_BY_CLOSE", "true").lower() == "true"
 
 HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "180"))
-REST_CONCURRENCY = int(os.getenv("REST_CONCURRENCY", "15"))
-WS_STREAMS_PER_CONNECTION = int(os.getenv("WS_STREAMS_PER_CONNECTION", "700"))
+REST_CONCURRENCY = int(os.getenv("REST_CONCURRENCY", "4"))
+WS_STREAMS_PER_CONNECTION = int(os.getenv("WS_STREAMS_PER_CONNECTION", "500"))
+REST_REQUEST_GAP = float(os.getenv("REST_REQUEST_GAP", "0.08"))
 STATE_FILE = Path(os.getenv("STATE_FILE", "/tmp/ahmed_of_state.json"))
 PORT = int(os.getenv("PORT", "8080"))
 
@@ -390,11 +392,39 @@ async def emit_zone_alert(
         await save_state()
 
 
-async def get_futures_symbols() -> List[str]:
+async def binance_get_json(path: str, params: Optional[dict] = None, attempts: int = 10):
+    """GET عام مع تدوير نطاقات Binance ومعالجة 418/429/451 تلقائيًا."""
     assert SESSION is not None
-    async with SESSION.get(f"{BINANCE_REST}/fapi/v1/exchangeInfo", timeout=30) as response:
-        response.raise_for_status()
-        data = await response.json()
+    last_error: Optional[Exception] = None
+    bases = BINANCE_REST_BASES or ["https://fapi.binance.com"]
+    for attempt in range(attempts):
+        base = bases[attempt % len(bases)]
+        url = f"{base}{path}"
+        try:
+            async with SESSION.get(url, params=params, timeout=35) as response:
+                if response.status == 200:
+                    return await response.json()
+                body = (await response.text())[:300]
+                if response.status in (418, 429, 451) or response.status >= 500:
+                    retry_after = response.headers.get("Retry-After")
+                    wait = float(retry_after) if retry_after and retry_after.isdigit() else min(60.0, 2.0 ** min(attempt, 5))
+                    wait += random.uniform(0.2, 1.0)
+                    log.warning("Binance HTTP %s via %s; retry in %.1fs: %s", response.status, base, wait, body)
+                    await asyncio.sleep(wait)
+                    continue
+                raise RuntimeError(f"Binance HTTP {response.status}: {body}")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            last_error = exc
+            wait = min(30.0, 1.5 * (attempt + 1)) + random.uniform(0.1, 0.8)
+            log.warning("Binance request failed via %s: %s; retry in %.1fs", base, exc, wait)
+            await asyncio.sleep(wait)
+    raise RuntimeError(f"All Binance endpoints failed for {path}: {last_error}")
+
+
+async def get_futures_symbols() -> List[str]:
+    data = await binance_get_json("/fapi/v1/exchangeInfo", attempts=15)
     symbols = [
         item["symbol"]
         for item in data.get("symbols", [])
@@ -402,6 +432,8 @@ async def get_futures_symbols() -> List[str]:
         and item.get("quoteAsset") == "USDT"
         and item.get("status") == "TRADING"
     ]
+    if not symbols:
+        raise RuntimeError("Binance returned no active USDT perpetual contracts")
     return sorted(set(symbols))
 
 
@@ -410,40 +442,28 @@ async def fetch_klines(
     symbol: str,
     timeframe: str,
 ) -> Tuple[str, str, List[Candle]]:
-    assert SESSION is not None
     params = {"symbol": symbol, "interval": timeframe, "limit": HISTORY_LIMIT}
     async with semaphore:
-        for attempt in range(5):
-            try:
-                async with SESSION.get(
-                    f"{BINANCE_REST}/fapi/v1/klines",
-                    params=params,
-                    timeout=30,
-                ) as response:
-                    if response.status in (418, 429):
-                        await asyncio.sleep(5 * (attempt + 1))
-                        continue
-                    response.raise_for_status()
-                    rows = await response.json()
-                    candles = [
-                        Candle(
-                            open_time=int(r[0]),
-                            open=float(r[1]),
-                            high=float(r[2]),
-                            low=float(r[3]),
-                            close=float(r[4]),
-                            volume=float(r[5]),
-                            close_time=int(r[6]),
-                            closed=int(r[6]) < int(time.time() * 1000),
-                        )
-                        for r in rows
-                    ]
-                    return symbol, timeframe, candles
-            except Exception as exc:
-                if attempt == 4:
-                    log.error("Klines failed %s %s: %s", symbol, timeframe, exc)
-                await asyncio.sleep(1.5 * (attempt + 1))
-    return symbol, timeframe, []
+        try:
+            rows = await binance_get_json("/fapi/v1/klines", params=params, attempts=8)
+            await asyncio.sleep(REST_REQUEST_GAP + random.uniform(0.0, 0.04))
+            candles = [
+                Candle(
+                    open_time=int(r[0]),
+                    open=float(r[1]),
+                    high=float(r[2]),
+                    low=float(r[3]),
+                    close=float(r[4]),
+                    volume=float(r[5]),
+                    close_time=int(r[6]),
+                    closed=int(r[6]) < int(time.time() * 1000),
+                )
+                for r in rows
+            ]
+            return symbol, timeframe, candles
+        except Exception as exc:
+            log.error("Klines failed %s %s: %s", symbol, timeframe, exc)
+            return symbol, timeframe, []
 
 
 def rebuild_state(symbol: str, timeframe: str, candles: List[Candle]) -> ZoneState:
@@ -640,7 +660,7 @@ async def main() -> None:
         log.warning("Telegram variables are missing; scanner runs but cannot send alerts.")
 
     timeout = aiohttp.ClientTimeout(total=40)
-    connector = aiohttp.TCPConnector(limit=REST_CONCURRENCY + 20, ttl_dns_cache=300)
+    connector = aiohttp.TCPConnector(limit=max(30, REST_CONCURRENCY + 20), ttl_dns_cache=300, enable_cleanup_closed=True)
     SESSION = aiohttp.ClientSession(timeout=timeout, connector=connector)
     runner = await start_health_server()
 
